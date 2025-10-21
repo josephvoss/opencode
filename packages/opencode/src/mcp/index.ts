@@ -8,6 +8,10 @@ import { NamedError } from "../util/error"
 import z from "zod/v4"
 import { Instance } from "../project/instance"
 import { withTimeout } from "@/util/timeout"
+import { Global } from "../global"
+import path from "path"
+import { Bus } from "../bus"
+import { Session } from "../session"
 
 export namespace MCP {
   const log = Log.create({ service: "mcp" })
@@ -126,12 +130,25 @@ export namespace MCP {
     let status: Status | undefined = undefined
 
     if (mcp.type === "remote") {
+      const headers: Record<string, string> = { ...mcp.headers }
+
+      try {
+        const tokensPath = path.join(Global.Path.data, "mcp-auth", key, "tokens.json")
+        const tokensData = await Bun.file(tokensPath).text()
+        const tokens = JSON.parse(tokensData)
+        if (tokens.access_token) {
+          headers.Authorization = `Bearer ${tokens.access_token}`
+        }
+      } catch {
+        // No tokens stored, will connect with auth set from config
+      }
+
       const transports = [
         {
           name: "StreamableHTTP",
           transport: new StreamableHTTPClientTransport(new URL(mcp.url), {
             requestInit: {
-              headers: mcp.headers,
+              headers,
             },
           }),
         },
@@ -139,7 +156,7 @@ export namespace MCP {
           name: "SSE",
           transport: new SSEClientTransport(new URL(mcp.url), {
             requestInit: {
-              headers: mcp.headers,
+              headers,
             },
           }),
         },
@@ -171,6 +188,18 @@ export namespace MCP {
             return false
           })
         if (result) break
+      }
+      if (!mcpClient && lastError) {
+        const errorMessage = `MCP server ${key} failed to connect: ${lastError.message}`
+        log.error("remote mcp connection failed", { key, url: mcp.url, error: lastError.message })
+        Bus.publish(Session.Event.Error, {
+          error: {
+            name: "UnknownError",
+            data: {
+              message: errorMessage,
+            },
+          },
+        })
       }
     }
 

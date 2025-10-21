@@ -9,12 +9,152 @@ import os from "os"
 import { Global } from "../../global"
 import { Plugin } from "../../plugin"
 import { Instance } from "../../project/instance"
+import { Client } from "@modelcontextprotocol/sdk/client/index.js"
+import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js"
+import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js"
+import type { OAuthClientProvider } from "@modelcontextprotocol/sdk/client/auth.js"
+import { Config } from "../../config/config"
+import { Log } from "../../util/log"
+
+const log = Log.create({ service: "auth" })
+
+class SecureOAuthProvider implements OAuthClientProvider {
+  private serverKey: string
+  private redirectUri: string
+  private clientName: string
+  private service: string
+  private _state: string
+  private storagePath: string
+  private resourceParams?: string
+
+  constructor(serverKey: string, redirectUri: string, clientName: string = "opencode", resourceParams?: string) {
+    this.serverKey = serverKey
+    this.redirectUri = redirectUri
+    this.clientName = clientName
+    this.service = `ai.opencode.mcp.${serverKey}`
+    this._state = serverKey
+    this.storagePath = path.join(Global.Path.data, "mcp-auth", serverKey)
+    if (resourceParams) {
+      this.resourceParams = resourceParams
+    }
+  }
+
+  private getSecretPath(name: string): string {
+    return path.join(this.storagePath, name)
+  }
+
+  private async ensureStorageDir(): Promise<void> {
+    try {
+      await Bun.file(this.storagePath).exists()
+    } catch {
+      await Bun.$`mkdir -p ${this.storagePath}`
+    }
+  }
+
+  get redirectUrl(): string | URL {
+    return this.redirectUri
+  }
+
+  get clientMetadata() {
+    return {
+      redirect_uris: [this.redirectUri],
+      token_endpoint_auth_method: "none" as const,
+      grant_types: ["authorization_code", "refresh_token"],
+      response_types: ["code"],
+      client_name: this.clientName,
+    }
+  }
+
+  state(): string {
+    return this._state
+  }
+
+  async clientInformation() {
+    try {
+      const data = await Bun.file(this.getSecretPath("client.json")).text()
+      return JSON.parse(data)
+    } catch {
+      return undefined
+    }
+  }
+
+  async saveClientInformation(clientInformation: any): Promise<void> {
+    await this.ensureStorageDir()
+    await Bun.write(this.getSecretPath("client.json"), JSON.stringify(clientInformation))
+  }
+
+  async tokens() {
+    try {
+      const data = await Bun.file(this.getSecretPath("tokens.json")).text()
+      return JSON.parse(data)
+    } catch {
+      return undefined
+    }
+  }
+
+  async saveTokens(tokens: any): Promise<void> {
+    await this.ensureStorageDir()
+    await Bun.write(this.getSecretPath("tokens.json"), JSON.stringify(tokens))
+  }
+
+  async redirectToAuthorization(authUrl: URL): Promise<void> {
+    if (this.resourceParams) {
+      authUrl.searchParams.set("resource", this.resourceParams)
+    }
+    log.warn("OAuth authorization required", {
+      message: "Please visit the following URL to authorize",
+      url: authUrl.toString(),
+    })
+    try {
+      // gross
+      const command = process.platform === "darwin" ? "open" : process.platform === "win32" ? "start" : "xdg-open"
+      Bun.spawn([command, authUrl.toString()], { stdout: "ignore", stderr: "ignore" })
+    } catch (error) {
+      log.warn("Failed to open browser automatically", { error })
+    }
+  }
+
+  async saveCodeVerifier(codeVerifier: string): Promise<void> {
+    await this.ensureStorageDir()
+    await Bun.write(this.getSecretPath("verifier.txt"), codeVerifier)
+  }
+
+  async codeVerifier(): Promise<string> {
+    try {
+      const verifier = await Bun.file(this.getSecretPath("verifier.txt")).text()
+      if (!verifier) throw new Error("No code verifier saved for session")
+      return verifier
+    } catch {
+      throw new Error("No code verifier saved for session")
+    }
+  }
+
+  async invalidateCredentials(scope: "all" | "client" | "tokens" | "verifier"): Promise<void> {
+    const files = {
+      all: ["client.json", "tokens.json", "verifier.txt"],
+      client: ["client.json"],
+      tokens: ["tokens.json"],
+      verifier: ["verifier.txt"],
+    }
+
+    for (const file of files[scope]) {
+      try {
+        await Bun.$`rm -f ${this.getSecretPath(file)}`
+      } catch {}
+    }
+  }
+}
 
 export const AuthCommand = cmd({
   command: "auth",
   describe: "manage credentials",
   builder: (yargs) =>
-    yargs.command(AuthLoginCommand).command(AuthLogoutCommand).command(AuthListCommand).demandCommand(),
+    yargs
+      .command(AuthLoginCommand)
+      .command(AuthLogoutCommand)
+      .command(AuthListCommand)
+      .command(AuthMcpCommand)
+      .demandCommand(),
   async handler() {},
 })
 
@@ -62,6 +202,192 @@ export const AuthListCommand = cmd({
 
       prompts.outro(`${activeEnvVars.length} environment variable` + (activeEnvVars.length === 1 ? "" : "s"))
     }
+  },
+})
+
+export const AuthMcpCommand = cmd({
+  command: "mcp",
+  describe: "manage MCP server credentials",
+  builder: (yargs) => yargs.command(AuthMcpLoginCommand).demandCommand(),
+  async handler() {},
+})
+
+export const AuthMcpLoginCommand = cmd({
+  command: "login [server]",
+  describe: "log in to an MCP server",
+  builder: (yargs) =>
+    yargs.positional("server", {
+      describe: "MCP server name from config",
+      type: "string",
+    }),
+  async handler(args) {
+    await Instance.provide({
+      directory: process.cwd(),
+      async fn() {
+        UI.empty()
+        prompts.intro("MCP server login")
+
+        const cfg = await Config.get()
+        const mcpServers = cfg.mcp ?? {}
+        const remoteServers = Object.entries(mcpServers).filter(([_, config]) => config.type === "remote")
+
+        if (remoteServers.length === 0) {
+          prompts.log.error("No remote MCP servers configured in opencode.json")
+          prompts.outro("Done")
+          return
+        }
+
+        let serverKey = args.server
+        if (!serverKey) {
+          const selected = await prompts.select({
+            message: "Select MCP server",
+            options: remoteServers.map(([key, config]) => ({
+              label: key,
+              value: key,
+              hint: config.type === "remote" ? config.url : undefined,
+            })),
+          })
+          if (prompts.isCancel(selected)) throw new UI.CancelledError()
+          serverKey = selected as string
+        }
+
+        const mcpConfig = mcpServers[serverKey]
+        if (!mcpConfig) {
+          prompts.log.error(`MCP server "${serverKey}" not found in config`)
+          prompts.outro("Done")
+          return
+        }
+
+        if (mcpConfig.type !== "remote") {
+          prompts.log.error("Only remote MCP servers support authentication")
+          prompts.outro("Done")
+          return
+        }
+
+        prompts.log.info(`Authenticating with ${serverKey}`)
+        prompts.log.info(`Server: ${mcpConfig.url}`)
+
+        const callbackPort = 0
+        let authCode: string | undefined
+        let authResolve: ((value: string) => void) | undefined
+
+        const waitForAuthCode = new Promise<string>((resolve) => {
+          authResolve = resolve
+        })
+
+        const server = Bun.serve({
+          port: callbackPort,
+          fetch(req) {
+            const url = new URL(req.url)
+            if (url.pathname === "/oauth/callback") {
+              const code = url.searchParams.get("code")
+              if (code) {
+                authCode = code
+                authResolve?.(code)
+                return new Response(
+                  "<html><body><h1>Authentication successful!</h1><p>You can close this window and return to the CLI.</p></body></html>",
+                  {
+                    headers: { "Content-Type": "text/html" },
+                  },
+                )
+              }
+              return new Response("<html><body><h1>Authentication failed</h1><p>No code received</p></body></html>", {
+                status: 400,
+                headers: { "Content-Type": "text/html" },
+              })
+            }
+            return new Response("Not found", { status: 404 })
+          },
+        })
+
+        const actualPort = server.port
+        const redirectUri = `http://localhost:${actualPort}/oauth/callback`
+        const mcpUrl = new URL(mcpConfig.url)
+        const provider = new SecureOAuthProvider(serverKey, redirectUri, "opencode", mcpUrl.origin)
+
+        const spinner = prompts.spinner()
+        spinner.start("Connecting to MCP server...")
+
+        try {
+          const client = new Client(
+            {
+              name: "opencode-auth",
+              version: "1.0.0",
+            },
+            {
+              capabilities: {},
+            },
+          )
+
+          const transports = [
+            {
+              name: "StreamableHTTP",
+              create: () => new StreamableHTTPClientTransport(new URL(mcpConfig.url), { authProvider: provider }),
+            },
+            {
+              name: "SSE",
+              create: () => new SSEClientTransport(new URL(mcpConfig.url), { authProvider: provider }),
+            },
+          ]
+
+          let lastError: Error | undefined
+          let success = false
+
+          for (const { name, create } of transports) {
+            const transport = create()
+            try {
+              await client.connect(transport)
+              spinner.stop("Already authenticated")
+              prompts.log.success(`Already authenticated with ${serverKey} (${name})`)
+              success = true
+              break
+            } catch (error: any) {
+              if (error?.message?.includes("Unauthorized") || error?.code === "UNAUTHORIZED") {
+                spinner.message("Authorization required, opening browser...")
+
+                const code = await waitForAuthCode
+
+                spinner.message("Completing authorization...")
+                try {
+                  await transport.finishAuth(code)
+                  spinner.stop("Login successful")
+                  prompts.log.success(`Successfully authenticated with ${serverKey} (${name})`)
+                  prompts.log.info(
+                    "Tokens have been saved and will be used automatically when connecting to this MCP server",
+                  )
+                  success = true
+                  break
+                } catch (finishError: any) {
+                  lastError = finishError instanceof Error ? finishError : new Error(String(finishError))
+                  log.error("finishAuth failed", { transport: name, error: finishError, code })
+                }
+              } else {
+                lastError = error instanceof Error ? error : new Error(String(error))
+                log.error("transport connection failed", { transport: name, error: lastError.message })
+              }
+            } finally {
+              try {
+                await client.close()
+              } catch {}
+            }
+          }
+
+          if (!success) {
+            spinner.stop("Failed to authorize", 1)
+            log.error("OAuth flow failed", { error: lastError })
+            prompts.log.error(`Error: ${lastError?.message || "All transports failed"}`)
+          }
+        } catch (error) {
+          spinner.stop("Failed to authorize", 1)
+          log.error("OAuth flow failed", { error })
+          prompts.log.error(`Error: ${error instanceof Error ? error.message : String(error)}`)
+        } finally {
+          server.stop()
+        }
+
+        prompts.outro("Done")
+      },
+    })
   },
 })
 
